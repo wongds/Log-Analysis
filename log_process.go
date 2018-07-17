@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"net/url"
 	"github.com/influxdata/influxdb/client/v2"
+	"flag"
 )
 
 type Write interface {
@@ -53,7 +54,7 @@ type Message struct {
 }
 
 // 优化：只有这三个函数扩展性很差，只能从文件读写，可能还需要从标准输入输出里面读写，再定义模块太麻烦了，所以需要实现读写的接口，
-// 读取模块
+// 读取模块，从文件中读取内容写入到通道中
 func (rf *ReadFromFile) read(rCh chan []byte) {
 	// 打开文件，还有一种读取文件的方法是	ioutil.ReadFile(rf.path)。但是这种没有os.open的方式灵活，os.open的方式能够流式读取文件最后面的
 	f, err := os.Open(rf.path)
@@ -88,7 +89,7 @@ func (rf *ReadFromFile) read(rCh chan []byte) {
 172.0.0.12 - - [04/Mar/2018:13:49:52 +0000] http "GET /foo?queery=t HTTP/1.0" 200 2133 "-" "KeepAliveClient" "-" 1.005 1.854
 注意： 测试的时候出现了一点问题，就是echo追加内容到文件的时候，会解析带""的字符串去掉""，所以需要给”的地方加上转义字符\"
 */
-// 解析模块
+// 解析模块，循环解析通道中的内容
 func (l *LogProcess) ParseFromRead() {
 	reger := regexp.MustCompile(`([\d\.]+)\s+([^ \[]+)\s+([^ \[]+)\s+\[([^\]]+)\]\s+([a-z]+)\s+\"([^"]+)\"\s+(\d{3})\s+(\d+)\s+\"([^"]+)\"\s+\"(.*?)\"\s+\"([\d\.-]+)\"\s+([\d\.-]+)\s+([\d\.-]+)`)
 	// 时区
@@ -198,14 +199,19 @@ func (lw *WriteToInfluxdb) write(wCh chan *Message) {
 }
 
 func main() {
+	var path, influxdbinfo string
+	flag.StringVar(&path, "path", "./log.l", "这里应该是命令行参数-path=\"日志文件的地址（反斜杠是转义字符，实际上不需要加）\"")
+	flag.StringVar(&influxdbinfo, "influxdbinfo", "http://192.168.75.144:8086&admin&admin&MYDB&s", "命令行参数，数据库信息-influxdb=\"数据库信息字符串\"")
+	flag.Parse()
 	loger := &LogProcess{
 		// 这里发现一定要使用&struct，不知道为什么。难道是直接实例化不会当做接口实现，一定要传引用？
 		r: &ReadFromFile{
 			//path: "D:/mygo/src/Log-Analysis/log.txt",
-			path: "./log.l",
+			path: path,
 		},
 		w: &WriteToInfluxdb{
-			influxdbinfo: "http://192.168.75.144:8086&admin&admin&MYDB&s",
+			// 这里这样写死，扩展性很差。可以直接写入到启动参数
+			influxdbinfo: influxdbinfo,
 		},
 		rCh: make(chan []byte),
 		wCh: make(chan *Message),
