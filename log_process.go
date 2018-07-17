@@ -200,7 +200,7 @@ func (lw *WriteToInfluxdb) write(wCh chan *Message) {
 
 func main() {
 	var path, influxdbinfo string
-	flag.StringVar(&path, "path", "./log.l", "这里应该是命令行参数-path=\"日志文件的地址（反斜杠是转义字符，实际上不需要加）\"")
+	flag.StringVar(&path, "path", "./log.txt", "这里应该是命令行参数-path=\"日志文件的地址（反斜杠是转义字符，实际上不需要加）\"")
 	flag.StringVar(&influxdbinfo, "influxdbinfo", "http://192.168.75.144:8086&admin&admin&MYDB&s", "命令行参数，数据库信息-influxdb=\"数据库信息字符串\"")
 	flag.Parse()
 	loger := &LogProcess{
