@@ -12,6 +12,7 @@ import (
 	"log"
 	"strconv"
 	"net/url"
+	"github.com/influxdata/influxdb/client/v2"
 )
 
 type Write interface {
@@ -22,7 +23,7 @@ type Read interface {
 	read(rChan chan []byte)
 }
 
-//结构体作为对象的封装
+// 结构体作为对象封装
 type LogProcess struct {
 	r Read
 	w Write
@@ -45,10 +46,10 @@ type WriteToInfluxdb struct {
 
 // 接受日志解析内容的结构体
 type Message struct {
-	TimeLocal                    time.Time
-	BytesSent                    int
-	Path, Method, Scheme, Status string
-	UpstreamTime, RequestTime    float64
+	TimeLocal                    time.Time // 当前时间
+	BytesSent                    int       // 发送大小
+	Path, Method, Scheme, Status string    // 路径，调用的方法，scheme， 状态
+	UpstreamTime, RequestTime    float64   // 上传时间，请求时间
 }
 
 // 优化：只有这三个函数扩展性很差，只能从文件读写，可能还需要从标准输入输出里面读写，再定义模块太麻烦了，所以需要实现读写的接口，
@@ -109,7 +110,7 @@ func (l *LogProcess) ParseFromRead() {
 			log.Println("时间格式不对", err.Error(), ret[4])
 			continue
 		}
-		message.TimeLocal =time
+		message.TimeLocal = time
 
 		byteSent, _ := strconv.Atoi(ret[8])
 		message.BytesSent = byteSent
@@ -135,16 +136,64 @@ func (l *LogProcess) ParseFromRead() {
 		message.UpstreamTime = upstreamTime
 		message.RequestTime = requestTime
 
-
 		l.wCh <- message
 	}
 }
 
 // 写入模块
-func (l *WriteToInfluxdb) write(wCh chan *Message) {
-	// 循环写入
+// 将解析到的内容写入到时序数据库influxdb
+func (lw *WriteToInfluxdb) write(wCh chan *Message) {
+	// Create a new HTTPClient
+	lwslice := strings.Split(lw.influxdbinfo, "&")
+	c, err := client.NewHTTPClient(client.HTTPConfig{
+		Addr:     lwslice[0],
+		Username: lwslice[1],
+		Password: lwslice[2],
+	})
+	if err != nil {
+		log.Fatalf("读取写入信息失败,%s", err.Error())
+	}
+	defer c.Close()
+
+	// Create a new point batch
+	bp, err := client.NewBatchPoints(client.BatchPointsConfig{
+		Database:  lwslice[3],
+		Precision: lwslice[4],
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// 循环写入数据
 	for value := range wCh {
-		fmt.Println(value)
+		// Create a point and add to batch
+		// Path, Method, Scheme, Status string
+		tags := map[string]string{"path": value.Path, "method": value.Method, "scheme": value.Scheme, "status": value.Status}
+		// UpstreamTime, RequestTime    float64
+		//TimeLocal                    time.Time // 当前时间
+		//BytesSent                    int // 发送大小
+		fields := map[string]interface{}{
+			"time":         value.TimeLocal,
+			"bytesent":     value.BytesSent,
+			"upstreamtime": value.UpstreamTime,
+			"requesttime":  value.RequestTime,
+		}
+
+		pt, err := client.NewPoint("nginx_log", tags, fields, value.TimeLocal)
+		if err != nil {
+			log.Fatal(err)
+		}
+		bp.AddPoint(pt)
+
+		// Write the batch
+		if err := c.Write(bp); err != nil {
+			log.Fatal(err)
+		}
+		// Close client resources
+		if err := c.Close(); err != nil {
+			log.Fatal(err)
+		}
+		log.Println("写入成功")
 	}
 }
 
@@ -156,7 +205,7 @@ func main() {
 			path: "./log.l",
 		},
 		w: &WriteToInfluxdb{
-			influxdbinfo: "root&passworld&ip",
+			influxdbinfo: "http://192.168.75.144:8086&admin&admin&MYDB&s",
 		},
 		rCh: make(chan []byte),
 		wCh: make(chan *Message),
