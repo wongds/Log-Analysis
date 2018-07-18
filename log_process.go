@@ -14,6 +14,8 @@ import (
 	"net/url"
 	"github.com/influxdata/influxdb/client/v2"
 	"flag"
+	"net/http"
+	"encoding/json"
 )
 
 type Write interface {
@@ -74,8 +76,10 @@ func (rf *ReadFromFile) read(rCh chan []byte) {
 			time.Sleep(500 * time.Millisecond)
 			continue
 		} else if err != nil {
+			TypeMointorChan <- TypeErrNum
 			panic(fmt.Sprintf("PANIC: 文件读取失败，%s", err.Error()))
 		}
+		TypeMointorChan <- TypeHandLeLine
 		rCh <- line[:len(line)-1]
 	}
 	//str := "message"
@@ -108,6 +112,7 @@ func (l *LogProcess) ParseFromRead() {
 		// 将时间格式化golang中的时间格式，时间字段是在第四个字段里面
 		time, err := time.ParseInLocation("02/Jan/2006:15:04:05 +0000", ret[4], local)
 		if err != nil {
+			TypeMointorChan <- TypeErrNum
 			log.Println("时间格式不对", err.Error(), ret[4])
 			continue
 		}
@@ -118,12 +123,14 @@ func (l *LogProcess) ParseFromRead() {
 
 		reqLine := strings.Split(ret[6], " ")
 		if len(reqLine) != 3 {
+			TypeMointorChan <- TypeErrNum
 			log.Println("请求行解析失败：", ret[6])
 			continue
 		}
 		message.Method = reqLine[0]
 		url, err := url.Parse(reqLine[1])
 		if err != nil {
+			TypeMointorChan <- TypeErrNum
 			log.Println("path解析失败", err.Error(), reqLine[1])
 			continue
 		}
@@ -152,6 +159,7 @@ func (lw *WriteToInfluxdb) write(wCh chan *Message) {
 		Password: lwslice[2],
 	})
 	if err != nil {
+		TypeMointorChan <- TypeErrNum
 		log.Fatalf("读取写入信息失败,%s", err.Error())
 	}
 	defer c.Close()
@@ -162,6 +170,7 @@ func (lw *WriteToInfluxdb) write(wCh chan *Message) {
 		Precision: lwslice[4],
 	})
 	if err != nil {
+		TypeMointorChan <- TypeErrNum
 		log.Fatal(err)
 	}
 
@@ -182,20 +191,102 @@ func (lw *WriteToInfluxdb) write(wCh chan *Message) {
 
 		pt, err := client.NewPoint("nginx_log", tags, fields, value.TimeLocal)
 		if err != nil {
+			TypeMointorChan <- TypeErrNum
 			log.Fatal(err)
 		}
 		bp.AddPoint(pt)
 
 		// Write the batch
 		if err := c.Write(bp); err != nil {
+			TypeMointorChan <- TypeErrNum
 			log.Fatal(err)
 		}
 		// Close client resources
 		if err := c.Close(); err != nil {
+			TypeMointorChan <- TypeErrNum
 			log.Fatal(err)
 		}
 		log.Println("写入成功")
 	}
+}
+
+// 程序的监控模块
+// 思路：首先创建传送数据的结构体。包含需要监控的属性。这样就可以通过创建http服务来访问得到。（感觉可以直接集成到的写入模块的log里面显示，但是业务中应该不是这样，应该还是另外起一个模块）
+// 首先创建需要接收json数据的结构体
+// 系统状态监控，需要监控的信息
+type Systemmonitor struct {
+	HandleLine   int     `json:"handleLine"`   // 总处理日志行数
+	Tps          float64 `json:"tps"`          // 系统吞吐量。日志数/处理时间。定时获得handleline
+	ReadChanLen  int     `json:"readChanLen"`  // read channel长度
+	WriteChanLen int     `json:"writeChanLen"` // write channel长度
+	RunTime      string  `json:"runTime"`      // 运行总时间
+	ErrNum       int     `json:"errNum"`       // 错误数
+}
+
+// 作为监控模块的封装
+type Monitor struct {
+	startTime time.Time
+	data      Systemmonitor
+	handleSli []int // 这里原来考虑的是直接定义长度为2的slice但是判断是否是空比较麻烦
+}
+
+const (
+	TypeHandLeLine = 0
+	TypeErrNum     = 1
+)
+
+// 创建channel之后考虑在哪里添加，这里有读取行数在读取方法中添加
+var TypeMointorChan = make(chan int, 200)
+
+// 方法实现，通过http方式暴露信息
+func (monitor *Monitor) start(lp *LogProcess) {
+	// 使用goroutine消费监控的日志数和错误数数据
+	go func() {
+		for n := range TypeMointorChan {
+			switch n {
+			case TypeHandLeLine:
+				monitor.data.HandleLine++
+			case TypeErrNum:
+				monitor.data.ErrNum++
+			}
+		}
+	}()
+	// 接下来是吞吐量，思路是使用定时任务，定时获得handleline然后除以单位时间就是吞吐量
+	ticker := time.NewTicker(5 * time.Second)
+	// 还是使用协程来处理，不是很懂为什么需要协程处理，直接for循环不就行么。一直for循环
+	// 好像知道了，使用goroutine就不是阻塞的了，这样就能在执行后面步骤的时候同步执行这个功能。
+	go func() {
+		for {
+			<-ticker.C
+			monitor.handleSli = append(monitor.handleSli, monitor.data.HandleLine)
+			// 时刻保持slice的长度只能为2
+			if len(monitor.handleSli) > 2 {
+				monitor.handleSli = monitor.handleSli[1:]
+			}
+		}
+	}()
+
+	// 使用http暴露系统监控信息
+	// 首先考虑比较容易实现的RunTime, ReadChanLen和WriteChanLen，需要传入参数
+	http.HandleFunc("/monitor", func(writer http.ResponseWriter, req *http.Request) {
+		// 将得到的信息存储到定义的json结构体里面
+		// 之所以将这些属性放到hadnlefunc里面来赋值，是因为这些要求都是实时的。放在外面就不准确了，然后外面的errnum这种因为需要随时计算，因此放到外面，放到里面不会一直执行
+		monitor.data.RunTime = time.Now().Sub(monitor.startTime).String()
+		monitor.data.ReadChanLen = len(lp.rCh)
+		monitor.data.WriteChanLen = len(lp.wCh)
+		if len(monitor.handleSli) >= 2 {
+			monitor.data.Tps = float64(monitor.handleSli[1] - monitor.handleSli[0]) / 5
+		}
+		// 接下来考虑handlerline和errnum，有两种方式，一种是全局变量，但是这种在goroutine中可能会冲突，因为有多个goroutine不能保证线程安全
+		// 还有就是使用channel来做goroutine间的通信
+		monitor.data.ErrNum = <- TypeMointorChan
+		// 存完信息了直接将结构体渲染,marshalindent和marshal功能类似，只是使用了分隔符，更利于人看
+		ret, _ := json.MarshalIndent(monitor.data, "", "\t")
+		// 将内容输出到writer里面
+		io.WriteString(writer, string(ret))
+	})
+	// 这里这样是阻塞的
+	http.ListenAndServe(":9193", nil)
 }
 
 func main() {
@@ -213,15 +304,28 @@ func main() {
 			// 这里这样写死，扩展性很差。可以直接写入到启动参数
 			influxdbinfo: influxdbinfo,
 		},
-		rCh: make(chan []byte),
-		wCh: make(chan *Message),
+
+		// 优化思路，这里应该使用buffer的channel。否则只能存一个取一个.
+		rCh: make(chan []byte, 200),
+		wCh: make(chan *Message, 200),
 		//path:         "/var/log/messages/",
 		//influxdbinfo: "passworld&root",
 	}
-
+	// 优化思路，这里因为read的速度肯定最慢，然后是read，然后是write。因此这里多创建几个goroutine
 	go loger.r.read(loger.rCh)
-	go loger.ParseFromRead()
-	go loger.w.write(loger.wCh)
+	for i := 0; i < 2; i++ {
+		go loger.ParseFromRead()
+	}
+	for i := 0; i < 400; i++ {
+		go loger.w.write(loger.wCh)
+	}
+	// 实例化monitor
+	monitor := Monitor{
+		startTime: time.Now(),
+		data:      Systemmonitor{},
+	}
+	monitor.start(loger)
 
-	time.Sleep(60 * time.Second)
+	// 有了start方法这里就不用了，因为start中的http.litenandserver是阻塞的
+	//time.Sleep(60*time.Second)
 }
