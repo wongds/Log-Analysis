@@ -311,7 +311,7 @@ func main() {
 		//path:         "/var/log/messages/",
 		//influxdbinfo: "passworld&root",
 	}
-	// 优化思路，这里因为read的速度肯定最慢，然后是read，然后是write。因此这里多创建几个goroutine
+	// 优化思路，这里因为read的速度肯定最快，然后是read，然后是write。因此这里多创建几个goroutine
 	go loger.r.read(loger.rCh)
 	for i := 0; i < 2; i++ {
 		go loger.ParseFromRead()
